@@ -104,12 +104,45 @@ if st.button("Recommend") and selected_movie:
         st.stop()
     idx = selected_idx_list[0]
 
-    # Cosine similarities against all titles
-    similarities = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).ravel()
+    # Content-based similarity (genres TF-IDF)
+    content_sim = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).ravel()
 
-    # Hybrid score: 0.7 * content + 0.3 * normalized popularity (avg rating)
-    norm_rating = data["norm_rating"].fillna(0.0).values
-    final_score = 0.7 * similarities + 0.3 * norm_rating
+    # Item–item collaborative similarity using user–item pivot
+    global ratings_df_cached, user_item_pivot_cached
+    if ratings_df_cached is None:
+        ratings_df_cached = load_ratings(RATINGS_CSV_PATH)
+    if user_item_pivot_cached is None:
+        user_item_pivot_cached = build_user_item_pivot(ratings_df_cached)
+
+    item_sim = np.zeros_like(content_sim)
+    if not user_item_pivot_cached.empty:
+        # Align pivot columns (movieIds) with our data order
+        movie_ids_series = data.loc[:, "movieId"] if "movieId" in data.columns else None
+        if movie_ids_series is not None:
+            # Build matrix for item vectors: users x items
+            pivot = user_item_pivot_cached
+            # Ensure all movieIds appear in pivot (add missing columns filled with 0)
+            missing_cols = [m for m in movie_ids_series if m not in pivot.columns]
+            if missing_cols:
+                for m in missing_cols:
+                    pivot[m] = 0.0
+            pivot = pivot.loc[:, movie_ids_series]  # reorder columns to match data
+
+            # Compute cosine sim between selected movie column and all columns
+            from numpy.linalg import norm
+            target_vec = pivot.iloc[:, idx].values.astype(float)
+            matrix = pivot.values.astype(float)
+            # Cosine similarity manually to avoid large sklearn compute for 1 vector
+            numerator = matrix.T @ target_vec  # shape: (n_items,)
+            denom = (norm(matrix, axis=0) * norm(target_vec) + 1e-12)
+            item_sim = numerator / denom
+            item_sim = np.nan_to_num(item_sim, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Hybrid score: blend content and item–item CF
+    # Default weights; you can tune in UI if desired
+    w_content = 0.7
+    w_cf = 0.3
+    final_score = w_content * content_sim + w_cf * item_sim
 
     # Build results excluding the selected movie itself
     results = data.copy()
