@@ -161,22 +161,4 @@ if st.button("Recommend") and selected_movie:
             st.image(poster_url, width=150)
         st.markdown("---")
 
-    # Charts
-    st.subheader("Top Genres Chart")
-    genres_flat: list[str] = []
-    for g in data["genres_text"].fillna(""):
-        genres_flat += str(g).split()
-    if genres_flat:
-        genre_counts = pd.Series(genres_flat).value_counts().head(10)
-        fig, ax = plt.subplots()
-        genre_counts.plot(kind="bar", ax=ax)
-        ax.set_ylabel("Count")
-        ax.set_xlabel("Genre")
-        st.pyplot(fig)
-
-    st.subheader("Rating Distribution (Average per Movie)")
-    fig2, ax2 = plt.subplots()
-    data["avg_rating"].hist(bins=20, ax=ax2)
-    ax2.set_xlabel("Average Rating")
-    ax2.set_ylabel("Number of Movies")
-    st.pyplot(fig2)
+    # Charts moved to eda.ipynb
