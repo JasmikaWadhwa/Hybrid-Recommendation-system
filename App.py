@@ -60,8 +60,11 @@ def build_user_item_pivot(ratings_df: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
-# Lazily load ratings and build pivot only when needed
-RATINGS_CSV_PATH = os.environ.get("RATINGS_CSV_PATH", "ml-latest-small 2/ratings.csv")
+# Lazily load ratings and build pivot only when needed.
+# Prefer a TRAIN split if present (created in eda.ipynb), fallback to full ratings.
+default_ratings = "ml-latest-small 2/ratings.csv"
+train_ratings = "ml-latest-small 2/ratings_train.csv"
+RATINGS_CSV_PATH = train_ratings if os.path.exists(train_ratings) else default_ratings
 ratings_df_cached = None
 user_item_pivot_cached = None
 
