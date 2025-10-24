@@ -1,76 +1,167 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import requests
+import os
 import matplotlib.pyplot as plt
-
-# Load preprocessed data
-data = pd.read_csv('cleaned_movies.csv')
 
 st.title("Hybrid Movie Recommender")
 
-# Prepare average ratings and normalization
-avg_ratings = data.groupby('movieId')['rating'].mean().reset_index()
-rating_min, rating_max = avg_ratings['rating'].min(), avg_ratings['rating'].max()
-avg_ratings['norm_rating'] = (avg_ratings['rating'] - rating_min) / (rating_max - rating_min)
+# --- Data loading ---
+@st.cache_data
+def load_cleaned_data(path: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+        # Ensure expected columns exist
+        expected = {"movieId", "tmdbId", "title", "genres_text", "avg_rating", "norm_rating", "rating_count"}
+        missing = expected.difference(df.columns)
+        if missing:
+            st.error(f"Missing columns in cleaned data: {missing}. Please re-run preprocessing notebook.")
+        return df
+    except FileNotFoundError:
+        st.error("cleaned_movies.csv not found. Please open and run eda.ipynb first.")
+        return pd.DataFrame()
 
-# Merge normalized average ratings
-data = pd.merge(data, avg_ratings[['movieId', 'norm_rating']], on='movieId', how='left')
 
-# TF-IDF on 'overview' + 'genres_text'
-data['combined'] = (data['overview'].fillna('') + ' ' + data['genres_text'].fillna(''))
-tfidf = TfidfVectorizer(stop_words='english')
-tfidf_matrix = tfidf.fit_transform(data['combined'])
+data = load_cleaned_data("cleaned_movies.csv")
+if data.empty:
+    st.stop()
 
-# Movie selection interface
-movie_titles = data['title'].unique()
-selected_movie = st.selectbox("Pick a movie you like:", sorted(movie_titles))
+# --- Content-based features (TF-IDF on genres text) ---
+@st.cache_resource
+def build_tfidf_matrix(genres_text: pd.Series):
+    tfidf_vectorizer = TfidfVectorizer(stop_words="english")
+    matrix = tfidf_vectorizer.fit_transform(genres_text.fillna(""))
+    return matrix
 
-if st.button("Recommend"):
-    idx = data[data['title'] == selected_movie].index[0]
-    similarities = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
-    # Combine with normalized average rating
-    final_score = 0.7 * similarities + 0.3 * data['norm_rating']
-    data['final_score'] = final_score
 
-    # Top-10 recommendations (exclude selected movie)
-    recommendations = data[data['title'] != selected_movie].sort_values('final_score', ascending=False).head(10)
-    
+tfidf_matrix = build_tfidf_matrix(data["genres_text"])
+
+# --- Ratings loading and user–item pivot (for item–item CF) ---
+@st.cache_data
+def load_ratings(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, usecols=["userId", "movieId", "rating"])  # small and sufficient
+    except FileNotFoundError:
+        st.warning("ratings.csv not found. Item–item CF will be skipped.")
+        return pd.DataFrame(columns=["userId", "movieId", "rating"]).astype({
+            "userId": "int64", "movieId": "int64", "rating": "float64"
+        })
+
+
+@st.cache_resource
+def build_user_item_pivot(ratings_df: pd.DataFrame) -> pd.DataFrame:
+    if ratings_df.empty:
+        return pd.DataFrame()
+    pivot = ratings_df.pivot_table(index="userId", columns="movieId", values="rating", aggfunc="mean")
+    pivot = pivot.fillna(0.0)
+    return pivot
+
+
+# Lazily load ratings and build pivot only when needed.
+# Prefer a TRAIN split if present (created in eda.ipynb), fallback to full ratings.
+default_ratings = "ml-latest-small 2/ratings.csv"
+train_ratings = "ml-latest-small 2/ratings_train.csv"
+RATINGS_CSV_PATH = train_ratings if os.path.exists(train_ratings) else default_ratings
+ratings_df_cached = None
+user_item_pivot_cached = None
+
+# --- UI: movie selection ---
+movie_titles = sorted(data["title"].dropna().unique().tolist())
+selected_movie = st.selectbox("Pick a movie you like:", movie_titles, index=0 if movie_titles else None)
+
+
+def get_tmdb_api_key() -> str | None:
+    # Prefer Streamlit secrets, fallback to environment variable
+    if "tmdb_api_key" in st.secrets:
+        return st.secrets["tmdb_api_key"]
+    return os.getenv("TMDB_API_KEY")
+
+
+def fetch_poster_url(tmdb_id: float | int | None, api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    try:
+        # Try by tmdbId first when available
+        if pd.notna(tmdb_id):
+            tmdb_id_int = int(tmdb_id)
+            r = requests.get(
+                f"https://api.themoviedb.org/3/movie/{tmdb_id_int}", params={"api_key": api_key}, timeout=10
+            )
+            if r.ok:
+                poster_path = r.json().get("poster_path")
+                if poster_path:
+                    return f"https://image.tmdb.org/t/p/w200{poster_path}"
+        return None
+    except Exception:
+        return None
+
+
+if st.button("Recommend") and selected_movie:
+    # Locate selected movie index (first match if duplicates)
+    selected_idx_list = data.index[data["title"] == selected_movie].tolist()
+    if not selected_idx_list:
+        st.warning("Selected movie not found in data.")
+        st.stop()
+    idx = selected_idx_list[0]
+
+    # Content-based similarity (genres TF-IDF)
+    content_sim = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).ravel()
+
+    # Item–item collaborative similarity using user–item pivot
+    global ratings_df_cached, user_item_pivot_cached
+    if ratings_df_cached is None:
+        ratings_df_cached = load_ratings(RATINGS_CSV_PATH)
+    if user_item_pivot_cached is None:
+        user_item_pivot_cached = build_user_item_pivot(ratings_df_cached)
+
+    item_sim = np.zeros_like(content_sim)
+    if not user_item_pivot_cached.empty:
+        # Align pivot columns (movieIds) with our data order
+        movie_ids_series = data.loc[:, "movieId"] if "movieId" in data.columns else None
+        if movie_ids_series is not None:
+            # Build matrix for item vectors: users x items
+            pivot = user_item_pivot_cached
+            # Ensure all movieIds appear in pivot (add missing columns filled with 0)
+            missing_cols = [m for m in movie_ids_series if m not in pivot.columns]
+            if missing_cols:
+                for m in missing_cols:
+                    pivot[m] = 0.0
+            pivot = pivot.loc[:, movie_ids_series]  # reorder columns to match data
+
+            # Compute cosine sim between selected movie column and all columns
+            from numpy.linalg import norm
+            target_vec = pivot.iloc[:, idx].values.astype(float)
+            matrix = pivot.values.astype(float)
+            # Cosine similarity manually to avoid large sklearn compute for 1 vector
+            numerator = matrix.T @ target_vec  # shape: (n_items,)
+            denom = (norm(matrix, axis=0) * norm(target_vec) + 1e-12)
+            item_sim = numerator / denom
+            item_sim = np.nan_to_num(item_sim, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Hybrid score: blend content and item–item CF
+    # Default weights; you can tune in UI if desired
+    w_content = 0.7
+    w_cf = 0.3
+    final_score = w_content * content_sim + w_cf * item_sim
+
+    # Build results excluding the selected movie itself
+    results = data.copy()
+    results["final_score"] = final_score
+    results = results[results.index != idx]
+    recommendations = results.sort_values("final_score", ascending=False).head(10)
+
     st.subheader("Top 10 Recommendations")
+    api_key = get_tmdb_api_key()
     for _, row in recommendations.iterrows():
-        # TMDb API Poster
-        poster_url = None
-        tmdb_key = "YOUR_TMDB_API_KEY"
-        response = requests.get(
-            f"https://api.themoviedb.org/3/search/movie?api_key={tmdb_key}&query={row['title']}"
-        )
-        if response.ok and response.json()['results']:
-            poster_path = response.json()['results'][0].get('poster_path', None)
-            if poster_path:
-                poster_url = f"https://image.tmdb.org/t/p/w200{poster_path}"
-        st.markdown(f"**Title:** {row['title'].title()}")
+        poster_url = fetch_poster_url(row.get("tmdbId"), api_key)
+        st.markdown(f"**Title:** {str(row['title']).title()}")
         st.markdown(f"**Genres:** {row['genres_text']}")
-        st.markdown(f"**Average Rating:** {round(row['rating'],2)}")
+        st.markdown(f"**Average Rating:** {round(float(row['avg_rating']), 2)}")
         if poster_url:
             st.image(poster_url, width=150)
         st.markdown("---")
-    
-    # Charts (Top genres)
-    st.subheader("Top Genres Chart")
-    genres_flat = []
-    for g in data['genres_text']:
-        genres_flat += g.split()
-    genre_counts = pd.Series(genres_flat).value_counts().head(10)
-    fig, ax = plt.subplots()
-    genre_counts.plot(kind='bar', ax=ax)
-    st.pyplot(fig)
 
-    # Rating distribution
-    st.subheader("Rating Distribution")
-    fig2, ax2 = plt.subplots()
-    data['rating'].hist(bins=20, ax=ax2)
-    st.pyplot(fig2)
+    # Charts moved to eda.ipynb
