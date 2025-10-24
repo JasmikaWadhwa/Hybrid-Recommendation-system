@@ -39,6 +39,32 @@ def build_tfidf_matrix(genres_text: pd.Series):
 
 tfidf_matrix = build_tfidf_matrix(data["genres_text"])
 
+# --- Ratings loading and user–item pivot (for item–item CF) ---
+@st.cache_data
+def load_ratings(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, usecols=["userId", "movieId", "rating"])  # small and sufficient
+    except FileNotFoundError:
+        st.warning("ratings.csv not found. Item–item CF will be skipped.")
+        return pd.DataFrame(columns=["userId", "movieId", "rating"]).astype({
+            "userId": "int64", "movieId": "int64", "rating": "float64"
+        })
+
+
+@st.cache_resource
+def build_user_item_pivot(ratings_df: pd.DataFrame) -> pd.DataFrame:
+    if ratings_df.empty:
+        return pd.DataFrame()
+    pivot = ratings_df.pivot_table(index="userId", columns="movieId", values="rating", aggfunc="mean")
+    pivot = pivot.fillna(0.0)
+    return pivot
+
+
+# Lazily load ratings and build pivot only when needed
+RATINGS_CSV_PATH = os.environ.get("RATINGS_CSV_PATH", "ml-latest-small 2/ratings.csv")
+ratings_df_cached = None
+user_item_pivot_cached = None
+
 # --- UI: movie selection ---
 movie_titles = sorted(data["title"].dropna().unique().tolist())
 selected_movie = st.selectbox("Pick a movie you like:", movie_titles, index=0 if movie_titles else None)
