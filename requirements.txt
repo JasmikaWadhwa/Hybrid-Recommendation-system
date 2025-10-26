@@ -6,3 +6,6 @@ seaborn
 scikit-learn
 scikit-surprise
 scipy
+setuptools>=70.0
+wheel>=0.43.0
+Cython==3.0.10
